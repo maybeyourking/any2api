@@ -84,8 +84,11 @@ router.post("/v1/chat/completions", async (req, res): Promise<void> => {
   }
 
   try {
-    const response = await callAIResponse(model, messages, options, id, created);
-    req.log.info({ model }, "Received AI response");
+    const response = await callAIResponse(model, messages, options, id, created) as Record<string, unknown>;
+    const choice = (response.choices as Array<Record<string, unknown>>)?.[0];
+    const finishReason = choice?.finish_reason;
+    const hasToolCalls = !!(choice?.message as Record<string, unknown>)?.tool_calls;
+    req.log.info({ model, finishReason, hasToolCalls, msgCount: messages.length }, "Received AI response");
     res.json(response);
   } catch (err) {
     req.log.error({ err, model }, "AI call failed");
