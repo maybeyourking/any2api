@@ -54,7 +54,8 @@ router.post("/v1/chat/completions", async (req, res): Promise<void> => {
   const tools: OpenAITool[] | undefined = body.tools;
   const toolChoice: unknown = body.tool_choice;
 
-  req.log.info({ model, stream: streamRequested, hasTools: !!tools }, "POST /v1/chat/completions");
+  const msgRoles = messages.map((m: { role: string }) => m.role);
+  req.log.info({ model, stream: streamRequested, hasTools: !!tools, msgCount: messages.length, msgRoles }, "POST /v1/chat/completions");
 
   const id = generateId();
   const created = Math.floor(Date.now() / 1000);
@@ -68,7 +69,7 @@ router.post("/v1/chat/completions", async (req, res): Promise<void> => {
 
     try {
       await callAIStream(model, messages, options, res, id, created);
-      req.log.info({ model }, "Stream completed");
+      req.log.info({ model, msgCount: messages.length, msgRoles }, "Stream completed");
     } catch (err) {
       req.log.error({ err, model }, "AI stream failed");
       if (!res.headersSent) {
