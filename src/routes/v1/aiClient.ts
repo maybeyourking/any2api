@@ -474,8 +474,9 @@ export async function callAIStream(
     const client = getAnthropicClient();
     const { system, messages: anthropicMessages } = convertMessagesToAnthropic(messages);
 
-    // Accumulate tool_use blocks while streaming text
-    const toolUseMap: Map<number, { id: string; name: string; inputStr: string }> = new Map();
+    // Map: Anthropic content-block index → { oaiIndex: 0-based, id, name, inputStr }
+    const toolUseMap: Map<number, { oaiIndex: number; id: string; name: string; inputStr: string }> = new Map();
+    let nextToolOaiIndex = 0;
 
     const stream = await client.messages.create({
       model: canonicalModel,
@@ -491,11 +492,35 @@ export async function callAIStream(
 
     for await (const event of stream) {
       if (event.type === "content_block_start" && event.content_block.type === "tool_use") {
+        const oaiIndex = nextToolOaiIndex++;
         toolUseMap.set(event.index, {
+          oaiIndex,
           id: event.content_block.id,
           name: event.content_block.name,
           inputStr: "",
         });
+        // Emit the "intro" chunk: id + name + empty arguments (OpenAI streaming protocol)
+        sseWrite(
+          res,
+          JSON.stringify({
+            id,
+            object: "chat.completion.chunk",
+            created,
+            model: requestedModel,
+            choices: [{
+              index: 0,
+              delta: {
+                tool_calls: [{
+                  index: oaiIndex,
+                  id: event.content_block.id,
+                  type: "function",
+                  function: { name: event.content_block.name, arguments: "" },
+                }],
+              },
+              finish_reason: null,
+            }],
+          }),
+        );
       } else if (event.type === "content_block_delta") {
         if (event.delta.type === "text_delta") {
           sseWrite(
@@ -510,31 +535,33 @@ export async function callAIStream(
           );
         } else if (event.delta.type === "input_json_delta") {
           const tool = toolUseMap.get(event.index);
-          if (tool) tool.inputStr += event.delta.partial_json;
+          if (tool) {
+            tool.inputStr += event.delta.partial_json;
+            // Emit argument delta chunk
+            sseWrite(
+              res,
+              JSON.stringify({
+                id,
+                object: "chat.completion.chunk",
+                created,
+                model: requestedModel,
+                choices: [{
+                  index: 0,
+                  delta: {
+                    tool_calls: [{
+                      index: tool.oaiIndex,
+                      function: { arguments: event.delta.partial_json },
+                    }],
+                  },
+                  finish_reason: null,
+                }],
+              }),
+            );
+          }
         }
       } else if (event.type === "message_delta") {
         if (event.delta.stop_reason === "tool_use") stopReason = "tool_calls";
       }
-    }
-
-    // Send accumulated tool_calls as a single chunk
-    if (toolUseMap.size > 0) {
-      const toolCalls = Array.from(toolUseMap.entries()).map(([idx, t]) => ({
-        index: idx,
-        id: t.id,
-        type: "function",
-        function: { name: t.name, arguments: t.inputStr },
-      }));
-      sseWrite(
-        res,
-        JSON.stringify({
-          id,
-          object: "chat.completion.chunk",
-          created,
-          model: requestedModel,
-          choices: [{ index: 0, delta: { tool_calls: toolCalls }, finish_reason: null }],
-        }),
-      );
     }
 
     sseWrite(
