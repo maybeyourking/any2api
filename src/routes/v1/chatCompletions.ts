@@ -47,7 +47,7 @@ router.post("/v1/chat/completions", async (req, res): Promise<void> => {
   }
 
   const model: string = body.model ?? "gpt-5";
-  const messages: Array<{ role: "user" | "assistant" | "system"; content: string }> =
+  const messages: Array<{ role: "user" | "assistant" | "system"; content: string | unknown[] }> =
     body.messages ?? [];
   const temperature: number | undefined = body.temperature;
   const maxTokens: number | undefined = body.max_tokens;
