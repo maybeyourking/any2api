@@ -1,6 +1,6 @@
 import { Router, type IRouter } from "express";
 import { getCorsHeaders } from "./cors";
-import { callAI } from "./aiClient";
+import { callAI, callAIStreamAnthropic, type OpenAIMessage } from "./aiClient";
 
 const router: IRouter = Router();
 
@@ -11,9 +11,7 @@ function generateMsgId(): string {
 type ContentBlock = { type: string; text?: string };
 type AnthropicMessage = { role: string; content: string | ContentBlock[] };
 
-function convertAnthropicMessages(
-  messages: AnthropicMessage[],
-): Array<{ role: "user" | "assistant" | "system"; content: string }> {
+function convertAnthropicMessages(messages: AnthropicMessage[]): OpenAIMessage[] {
   return messages.map((msg) => {
     const role = msg.role as "user" | "assistant" | "system";
     if (typeof msg.content === "string") {
@@ -44,10 +42,7 @@ router.post("/v1/messages", async (req, res): Promise<void> => {
   if (!apiKey) {
     res.status(401).json({
       type: "error",
-      error: {
-        type: "authentication_error",
-        message: "Missing x-api-key or Authorization header",
-      },
+      error: { type: "authentication_error", message: "Missing x-api-key or Authorization header" },
     });
     return;
   }
@@ -56,10 +51,7 @@ router.post("/v1/messages", async (req, res): Promise<void> => {
   if (!body || typeof body !== "object") {
     res.status(400).json({
       type: "error",
-      error: {
-        type: "invalid_request_error",
-        message: "Invalid JSON body",
-      },
+      error: { type: "invalid_request_error", message: "Invalid JSON body" },
     });
     return;
   }
@@ -73,6 +65,28 @@ router.post("/v1/messages", async (req, res): Promise<void> => {
   req.log.info({ model, stream: streamRequested }, "POST /v1/messages");
 
   const openaiMessages = convertAnthropicMessages(rawMessages);
+  const id = generateMsgId();
+
+  if (streamRequested) {
+    res.setHeader("Content-Type", "text/event-stream");
+    res.setHeader("Cache-Control", "no-cache");
+    res.setHeader("Connection", "keep-alive");
+    res.setHeader("X-Accel-Buffering", "no");
+
+    try {
+      await callAIStreamAnthropic(model, openaiMessages, { temperature, maxTokens }, res, id);
+      req.log.info({ model }, "Stream completed");
+    } catch (err) {
+      req.log.error({ err, model }, "AI stream failed");
+      if (!res.headersSent) {
+        res.status(500).json({ type: "error", error: { type: "api_error", message: "AI model call failed" } });
+      } else {
+        res.write(`event: error\ndata: ${JSON.stringify({ type: "error", error: { type: "api_error", message: "Stream error" } })}\n\n`);
+        res.end();
+      }
+    }
+    return;
+  }
 
   let content: string;
   try {
@@ -80,93 +94,19 @@ router.post("/v1/messages", async (req, res): Promise<void> => {
     req.log.info({ contentLength: content.length }, "Received AI response");
   } catch (err) {
     req.log.error({ err, model }, "AI call failed");
-    res.status(500).json({
-      type: "error",
-      error: {
-        type: "api_error",
-        message: "AI model call failed",
-      },
-    });
+    res.status(500).json({ type: "error", error: { type: "api_error", message: "AI model call failed" } });
     return;
   }
 
-  const id = generateMsgId();
-
-  if (!streamRequested) {
-    res.json({
-      id,
-      type: "message",
-      role: "assistant",
-      content: [{ type: "text", text: content }],
-      model,
-      stop_reason: "end_turn",
-      usage: { input_tokens: 0, output_tokens: 0 },
-    });
-    return;
-  }
-
-  res.setHeader("Content-Type", "text/event-stream");
-  res.setHeader("Cache-Control", "no-cache");
-  res.setHeader("Connection", "keep-alive");
-
-  res.write(
-    `event: message_start\ndata: ${JSON.stringify({
-      type: "message_start",
-      message: {
-        id,
-        type: "message",
-        role: "assistant",
-        content: [],
-        model,
-      },
-    })}\n\n`,
-  );
-
-  res.write(
-    `event: content_block_start\ndata: ${JSON.stringify({
-      type: "content_block_start",
-      index: 0,
-      content_block: { type: "text", text: "" },
-    })}\n\n`,
-  );
-
-  const words = content.split(/(\s+)/);
-  const CHUNK_SIZE = 3;
-  for (let i = 0; i < words.length; i += CHUNK_SIZE) {
-    const chunk = words.slice(i, i + CHUNK_SIZE).join("");
-    if (chunk.length === 0) continue;
-    res.write(
-      `event: content_block_delta\ndata: ${JSON.stringify({
-        type: "content_block_delta",
-        index: 0,
-        delta: { type: "text_delta", text: chunk },
-      })}\n\n`,
-    );
-    await new Promise<void>((resolve) => setTimeout(resolve, 20));
-  }
-
-  res.write(
-    `event: content_block_stop\ndata: ${JSON.stringify({
-      type: "content_block_stop",
-      index: 0,
-    })}\n\n`,
-  );
-
-  res.write(
-    `event: message_delta\ndata: ${JSON.stringify({
-      type: "message_delta",
-      delta: { stop_reason: "end_turn" },
-      usage: { output_tokens: 0 },
-    })}\n\n`,
-  );
-
-  res.write(
-    `event: message_stop\ndata: ${JSON.stringify({
-      type: "message_stop",
-    })}\n\n`,
-  );
-
-  res.end();
+  res.json({
+    id,
+    type: "message",
+    role: "assistant",
+    content: [{ type: "text", text: content }],
+    model,
+    stop_reason: "end_turn",
+    usage: { input_tokens: 0, output_tokens: 0 },
+  });
 });
 
 export default router;
