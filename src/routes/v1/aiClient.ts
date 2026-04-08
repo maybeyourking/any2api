@@ -73,10 +73,61 @@ export function resolveModel(requestedModel: string): {
   return { family: "openai", canonicalModel: canonical };
 }
 
-type OpenAIMessage = {
+type OpenAIContentPart =
+  | { type: "text"; text: string }
+  | { type: "image_url"; image_url: { url: string; detail?: string } };
+
+export type OpenAIMessage = {
   role: "user" | "assistant" | "system";
-  content: string;
+  content: string | OpenAIContentPart[];
 };
+
+function contentToString(content: string | OpenAIContentPart[]): string {
+  if (typeof content === "string") return content;
+  return content
+    .filter((p) => p.type === "text")
+    .map((p) => (p as { type: "text"; text: string }).text)
+    .join("\n");
+}
+
+function convertContentForAnthropic(
+  content: string | OpenAIContentPart[],
+): Anthropic.MessageParam["content"] {
+  if (typeof content === "string") return content;
+
+  const blocks: Anthropic.ContentBlockParam[] = [];
+  for (const part of content) {
+    if (part.type === "text") {
+      blocks.push({ type: "text", text: part.text });
+    } else if (part.type === "image_url") {
+      const url = part.image_url.url;
+      if (url.startsWith("data:")) {
+        // base64 data URL: data:<media_type>;base64,<data>
+        const match = url.match(/^data:([^;]+);base64,(.+)$/);
+        if (match) {
+          blocks.push({
+            type: "image",
+            source: {
+              type: "base64",
+              media_type: match[1] as "image/jpeg" | "image/png" | "image/gif" | "image/webp",
+              data: match[2],
+            },
+          });
+        }
+      } else {
+        // Regular URL
+        blocks.push({
+          type: "image",
+          source: {
+            type: "url",
+            url,
+          },
+        });
+      }
+    }
+  }
+  return blocks;
+}
 
 export async function callAI(
   requestedModel: string,
@@ -89,7 +140,9 @@ export async function callAI(
     const client = getAnthropicClient();
     const systemMessages = messages.filter((m) => m.role === "system");
     const nonSystemMessages = messages.filter((m) => m.role !== "system");
-    const systemText = systemMessages.map((m) => m.content).join("\n");
+    const systemText = systemMessages
+      .map((m) => contentToString(m.content))
+      .join("\n");
 
     const response = await client.messages.create({
       model: canonicalModel,
@@ -100,7 +153,7 @@ export async function callAI(
         : {}),
       messages: nonSystemMessages.map((m) => ({
         role: m.role as "user" | "assistant",
-        content: m.content,
+        content: convertContentForAnthropic(m.content),
       })),
     });
 
@@ -114,7 +167,7 @@ export async function callAI(
   const client = getOpenAIClient();
   const response = await client.chat.completions.create({
     model: canonicalModel,
-    messages,
+    messages: messages as OpenAI.Chat.ChatCompletionMessageParam[],
     ...(options.temperature !== undefined
       ? { temperature: options.temperature }
       : {}),
