@@ -1,5 +1,6 @@
 import OpenAI from "openai";
 import Anthropic from "@anthropic-ai/sdk";
+import type { Response } from "express";
 
 function getOpenAIClient(): OpenAI {
   const baseURL = process.env.AI_INTEGRATIONS_OPENAI_BASE_URL;
@@ -102,7 +103,6 @@ function convertContentForAnthropic(
     } else if (part.type === "image_url") {
       const url = part.image_url.url;
       if (url.startsWith("data:")) {
-        // base64 data URL: data:<media_type>;base64,<data>
         const match = url.match(/^data:([^;]+);base64,(.+)$/);
         if (match) {
           blocks.push({
@@ -115,13 +115,9 @@ function convertContentForAnthropic(
           });
         }
       } else {
-        // Regular URL
         blocks.push({
           type: "image",
-          source: {
-            type: "url",
-            url,
-          },
+          source: { type: "url", url },
         });
       }
     }
@@ -129,6 +125,11 @@ function convertContentForAnthropic(
   return blocks;
 }
 
+function sseWrite(res: Response, data: string): void {
+  res.write(`data: ${data}\n\n`);
+}
+
+// Non-streaming: return full text
 export async function callAI(
   requestedModel: string,
   messages: OpenAIMessage[],
@@ -140,17 +141,13 @@ export async function callAI(
     const client = getAnthropicClient();
     const systemMessages = messages.filter((m) => m.role === "system");
     const nonSystemMessages = messages.filter((m) => m.role !== "system");
-    const systemText = systemMessages
-      .map((m) => contentToString(m.content))
-      .join("\n");
+    const systemText = systemMessages.map((m) => contentToString(m.content)).join("\n");
 
     const response = await client.messages.create({
       model: canonicalModel,
       max_tokens: options.maxTokens ?? 4096,
       ...(systemText ? { system: systemText } : {}),
-      ...(options.temperature !== undefined
-        ? { temperature: options.temperature as number }
-        : {}),
+      ...(options.temperature !== undefined ? { temperature: options.temperature as number } : {}),
       messages: nonSystemMessages.map((m) => ({
         role: m.role as "user" | "assistant",
         content: convertContentForAnthropic(m.content),
@@ -158,20 +155,208 @@ export async function callAI(
     });
 
     const block = response.content[0];
-    if (block?.type === "text") {
-      return block.text;
-    }
-    return "";
+    return block?.type === "text" ? block.text : "";
   }
 
   const client = getOpenAIClient();
   const response = await client.chat.completions.create({
     model: canonicalModel,
     messages: messages as OpenAI.Chat.ChatCompletionMessageParam[],
-    ...(options.temperature !== undefined
-      ? { temperature: options.temperature }
-      : {}),
+    ...(options.temperature !== undefined ? { temperature: options.temperature } : {}),
   });
 
   return response.choices[0]?.message?.content ?? "";
+}
+
+// Streaming in Anthropic SSE format for /v1/messages endpoint
+export async function callAIStreamAnthropic(
+  requestedModel: string,
+  messages: OpenAIMessage[],
+  options: { temperature?: number; maxTokens?: number },
+  res: Response,
+  id: string,
+): Promise<void> {
+  const { family, canonicalModel } = resolveModel(requestedModel);
+
+  res.write(
+    `event: message_start\ndata: ${JSON.stringify({
+      type: "message_start",
+      message: { id, type: "message", role: "assistant", content: [], model: requestedModel },
+    })}\n\n`,
+  );
+  res.write(
+    `event: content_block_start\ndata: ${JSON.stringify({
+      type: "content_block_start",
+      index: 0,
+      content_block: { type: "text", text: "" },
+    })}\n\n`,
+  );
+
+  if (family === "anthropic") {
+    const client = getAnthropicClient();
+    const systemMessages = messages.filter((m) => m.role === "system");
+    const nonSystemMessages = messages.filter((m) => m.role !== "system");
+    const systemText = systemMessages.map((m) => contentToString(m.content)).join("\n");
+
+    const stream = await client.messages.create({
+      model: canonicalModel,
+      max_tokens: options.maxTokens ?? 4096,
+      ...(systemText ? { system: systemText } : {}),
+      ...(options.temperature !== undefined ? { temperature: options.temperature as number } : {}),
+      messages: nonSystemMessages.map((m) => ({
+        role: m.role as "user" | "assistant",
+        content: convertContentForAnthropic(m.content),
+      })),
+      stream: true,
+    });
+
+    for await (const event of stream) {
+      if (event.type === "content_block_delta" && event.delta.type === "text_delta") {
+        res.write(
+          `event: content_block_delta\ndata: ${JSON.stringify({
+            type: "content_block_delta",
+            index: 0,
+            delta: { type: "text_delta", text: event.delta.text },
+          })}\n\n`,
+        );
+      }
+    }
+  } else {
+    const client = getOpenAIClient();
+    const stream = await client.chat.completions.create({
+      model: canonicalModel,
+      messages: messages as OpenAI.Chat.ChatCompletionMessageParam[],
+      ...(options.temperature !== undefined ? { temperature: options.temperature } : {}),
+      stream: true,
+    });
+
+    for await (const chunk of stream) {
+      const delta = chunk.choices[0]?.delta;
+      if (delta?.content) {
+        res.write(
+          `event: content_block_delta\ndata: ${JSON.stringify({
+            type: "content_block_delta",
+            index: 0,
+            delta: { type: "text_delta", text: delta.content },
+          })}\n\n`,
+        );
+      }
+    }
+  }
+
+  res.write(`event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: 0 })}\n\n`);
+  res.write(`event: message_delta\ndata: ${JSON.stringify({ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 0 } })}\n\n`);
+  res.write(`event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}\n\n`);
+  res.end();
+}
+
+// Streaming: write SSE chunks directly to res, then end
+export async function callAIStream(
+  requestedModel: string,
+  messages: OpenAIMessage[],
+  options: { temperature?: number; maxTokens?: number },
+  res: Response,
+  id: string,
+  created: number,
+): Promise<void> {
+  const { family, canonicalModel } = resolveModel(requestedModel);
+
+  // Send role chunk first
+  sseWrite(
+    res,
+    JSON.stringify({
+      id,
+      object: "chat.completion.chunk",
+      created,
+      model: requestedModel,
+      choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }],
+    }),
+  );
+
+  if (family === "anthropic") {
+    const client = getAnthropicClient();
+    const systemMessages = messages.filter((m) => m.role === "system");
+    const nonSystemMessages = messages.filter((m) => m.role !== "system");
+    const systemText = systemMessages.map((m) => contentToString(m.content)).join("\n");
+
+    const stream = await client.messages.create({
+      model: canonicalModel,
+      max_tokens: options.maxTokens ?? 4096,
+      ...(systemText ? { system: systemText } : {}),
+      ...(options.temperature !== undefined ? { temperature: options.temperature as number } : {}),
+      messages: nonSystemMessages.map((m) => ({
+        role: m.role as "user" | "assistant",
+        content: convertContentForAnthropic(m.content),
+      })),
+      stream: true,
+    });
+
+    for await (const event of stream) {
+      if (
+        event.type === "content_block_delta" &&
+        event.delta.type === "text_delta"
+      ) {
+        sseWrite(
+          res,
+          JSON.stringify({
+            id,
+            object: "chat.completion.chunk",
+            created,
+            model: requestedModel,
+            choices: [
+              {
+                index: 0,
+                delta: { content: event.delta.text },
+                finish_reason: null,
+              },
+            ],
+          }),
+        );
+      }
+    }
+  } else {
+    const client = getOpenAIClient();
+    const stream = await client.chat.completions.create({
+      model: canonicalModel,
+      messages: messages as OpenAI.Chat.ChatCompletionMessageParam[],
+      ...(options.temperature !== undefined ? { temperature: options.temperature } : {}),
+      stream: true,
+    });
+
+    for await (const chunk of stream) {
+      const delta = chunk.choices[0]?.delta;
+      if (delta?.content) {
+        sseWrite(
+          res,
+          JSON.stringify({
+            id,
+            object: "chat.completion.chunk",
+            created,
+            model: requestedModel,
+            choices: [
+              {
+                index: 0,
+                delta: { content: delta.content },
+                finish_reason: null,
+              },
+            ],
+          }),
+        );
+      }
+    }
+  }
+
+  // Final chunk with finish_reason
+  sseWrite(
+    res,
+    JSON.stringify({
+      id,
+      object: "chat.completion.chunk",
+      created,
+      model: requestedModel,
+      choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+    }),
+  );
+  res.write("data: [DONE]\n\n");
+  res.end();
 }
