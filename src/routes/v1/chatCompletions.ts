@@ -1,6 +1,6 @@
 import { Router, type IRouter } from "express";
 import { getCorsHeaders } from "./cors";
-import { callAI, callAIStream, type OpenAIMessage } from "./aiClient";
+import { callAIResponse, callAIStream, type OpenAIMessage, type OpenAITool } from "./aiClient";
 
 const router: IRouter = Router();
 
@@ -51,11 +51,14 @@ router.post("/v1/chat/completions", async (req, res): Promise<void> => {
   const temperature: number | undefined = body.temperature;
   const maxTokens: number | undefined = body.max_tokens;
   const streamRequested: boolean = body.stream === true;
+  const tools: OpenAITool[] | undefined = body.tools;
+  const toolChoice: unknown = body.tool_choice;
 
-  req.log.info({ model, stream: streamRequested }, "POST /v1/chat/completions");
+  req.log.info({ model, stream: streamRequested, hasTools: !!tools }, "POST /v1/chat/completions");
 
   const id = generateId();
   const created = Math.floor(Date.now() / 1000);
+  const options = { temperature, maxTokens, tools, toolChoice };
 
   if (streamRequested) {
     res.setHeader("Content-Type", "text/event-stream");
@@ -64,7 +67,7 @@ router.post("/v1/chat/completions", async (req, res): Promise<void> => {
     res.setHeader("X-Accel-Buffering", "no");
 
     try {
-      await callAIStream(model, messages, { temperature, maxTokens }, res, id, created);
+      await callAIStream(model, messages, options, res, id, created);
       req.log.info({ model }, "Stream completed");
     } catch (err) {
       req.log.error({ err, model }, "AI stream failed");
@@ -80,32 +83,16 @@ router.post("/v1/chat/completions", async (req, res): Promise<void> => {
     return;
   }
 
-  let content: string;
   try {
-    content = await callAI(model, messages, { temperature, maxTokens });
-    req.log.info({ contentLength: content.length }, "Received AI response");
+    const response = await callAIResponse(model, messages, options, id, created);
+    req.log.info({ model }, "Received AI response");
+    res.json(response);
   } catch (err) {
     req.log.error({ err, model }, "AI call failed");
     res.status(500).json({
       error: { message: "AI model call failed", type: "api_error", code: "model_error" },
     });
-    return;
   }
-
-  res.json({
-    id,
-    object: "chat.completion",
-    created,
-    model,
-    choices: [
-      {
-        index: 0,
-        message: { role: "assistant", content },
-        finish_reason: "stop",
-      },
-    ],
-    usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
-  });
 });
 
 export default router;
