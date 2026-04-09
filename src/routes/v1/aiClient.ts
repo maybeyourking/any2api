@@ -248,6 +248,12 @@ function anthropicResponseToOpenAI(
 
   const textContent = textBlocks.map((b) => b.text).join("") || null;
 
+  const usage = {
+    prompt_tokens: response.usage.input_tokens,
+    completion_tokens: response.usage.output_tokens,
+    total_tokens: response.usage.input_tokens + response.usage.output_tokens,
+  };
+
   if (toolUseBlocks.length > 0) {
     return {
       id,
@@ -272,7 +278,7 @@ function anthropicResponseToOpenAI(
           finish_reason: "tool_calls",
         },
       ],
-      usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+      usage,
     };
   }
 
@@ -288,7 +294,7 @@ function anthropicResponseToOpenAI(
         finish_reason: response.stop_reason === "end_turn" ? "stop" : (response.stop_reason ?? "stop"),
       },
     ],
-    usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+    usage,
   };
 }
 
@@ -489,9 +495,13 @@ export async function callAIStream(
     });
 
     let stopReason = "stop";
+    let inputTokens = 0;
+    let outputTokens = 0;
 
     for await (const event of stream) {
-      if (event.type === "content_block_start" && event.content_block.type === "tool_use") {
+      if (event.type === "message_start") {
+        inputTokens = event.message.usage.input_tokens;
+      } else if (event.type === "content_block_start" && event.content_block.type === "tool_use") {
         const oaiIndex = nextToolOaiIndex++;
         toolUseMap.set(event.index, {
           oaiIndex,
@@ -561,6 +571,7 @@ export async function callAIStream(
         }
       } else if (event.type === "message_delta") {
         if (event.delta.stop_reason === "tool_use") stopReason = "tool_calls";
+        if (event.usage) outputTokens = event.usage.output_tokens;
       }
     }
 
@@ -574,6 +585,29 @@ export async function callAIStream(
         choices: [{ index: 0, delta: {}, finish_reason: stopReason }],
       }),
     );
+
+    // Send usage chunk (required by some clients to confirm response is complete)
+    sseWrite(
+      res,
+      JSON.stringify({
+        id,
+        object: "chat.completion.chunk",
+        created,
+        model: requestedModel,
+        choices: [],
+        usage: {
+          prompt_tokens: inputTokens,
+          completion_tokens: outputTokens,
+          total_tokens: inputTokens + outputTokens,
+        },
+      }),
+    );
+
+    // Return streaming diagnostics so caller can log them
+    (res as unknown as { _streamDiag: { stopReason: string; toolCallCount: number } })._streamDiag = {
+      stopReason,
+      toolCallCount: toolUseMap.size,
+    };
   } else {
     const client = getOpenAIClient();
     const stream = await client.chat.completions.create({
