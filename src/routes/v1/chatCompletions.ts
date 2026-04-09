@@ -55,7 +55,12 @@ router.post("/v1/chat/completions", async (req, res): Promise<void> => {
   const toolChoice: unknown = body.tool_choice;
 
   const msgRoles = messages.map((m: { role: string }) => m.role);
-  req.log.info({ model, stream: streamRequested, hasTools: !!tools, msgCount: messages.length, msgRoles }, "POST /v1/chat/completions");
+  const msgPreview = messages.map((m: { role: string; content: unknown; tool_calls?: unknown }) => {
+    const c = m.content;
+    const text = typeof c === "string" ? c : JSON.stringify(c);
+    return { role: m.role, snippet: text?.slice(0, 80), hasToolCalls: !!(m as { tool_calls?: unknown }).tool_calls };
+  });
+  req.log.info({ model, stream: streamRequested, hasTools: !!tools, msgCount: messages.length, msgPreview }, "POST /v1/chat/completions");
 
   const id = generateId();
   const created = Math.floor(Date.now() / 1000);
@@ -69,7 +74,8 @@ router.post("/v1/chat/completions", async (req, res): Promise<void> => {
 
     try {
       await callAIStream(model, messages, options, res, id, created);
-      req.log.info({ model, msgCount: messages.length, msgRoles }, "Stream completed");
+      const diag = (res as unknown as { _streamDiag?: { stopReason: string; toolCallCount: number } })._streamDiag;
+      req.log.info({ model, msgCount: messages.length, msgRoles, stopReason: diag?.stopReason, toolCallCount: diag?.toolCallCount }, "Stream completed");
     } catch (err) {
       req.log.error({ err, model }, "AI stream failed");
       if (!res.headersSent) {
